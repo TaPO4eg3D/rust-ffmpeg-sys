@@ -171,8 +171,8 @@ fn fetch() -> io::Result<()> {
         .arg("clone")
         .arg("--depth=1")
         .arg("-b")
-        .arg(format!("release/{}", version()))
-        .arg("https://github.com/FFmpeg/FFmpeg")
+        .arg(env::var("FFMPEG_OVERRIDE_BRANCH").unwrap_or(format!("release/{}", version())))
+        .arg(env::var("FFMPEG_REPO_URL").unwrap_or("https://github.com/FFmpeg/FFmpeg".to_string()))
         .arg(&clone_dest_dir)
         .status()?;
 
@@ -536,9 +536,6 @@ fn build(sysroot: Option<&str>) -> io::Result<()> {
     // position independent code
     configure.arg("--enable-pic");
 
-    // stop autodetected libraries enabling themselves, causing linking errors
-    configure.arg("--disable-autodetect");
-
     // do not build programs since we don't need them
     configure.arg("--disable-programs");
 
@@ -687,24 +684,26 @@ fn build(sysroot: Option<&str>) -> io::Result<()> {
     if env::var("CARGO_FEATURE_BUILD_NVIDIA").is_ok()
         && matches!(target_os.as_str(), "linux" | "windows")
     {
-        configure.arg("--enable-libnpp");
-        configure.arg("--enable-cuda-nvcc");
-        configure.arg("--enable-cuvid");
+        configure.arg("--enable-nonfree");
         configure.arg("--enable-nvenc");
+        configure.arg("--enable-nvdec");
         configure.arg("--enable-cuda-llvm");
 
-        let cuda_path = env::var("CUDA_PATH").unwrap_or(if target_os == "linux" {
-            "/usr/local/cuda".to_string()
-        } else {
-            "C:\\Program Files\\NVIDIA GPU Computing Toolkit\\CUDA".to_string()
-        });
-        println!("cargo:rustc-link-arg=-L{cuda_path}/lib64");
-        println!("cargo:rustc-link-arg=-I{cuda_path}/include");
+        if target_os == "linux" {
+            let cuda_lib = pkg_config::probe_library("cuda").expect("CUDA is not found");
 
-        // Additional configuration may be needed for CUDA toolkit path
-        // This could be provided as an environment variable
-        if let Ok(cuda_path) = env::var("CUDA_PATH") {
-            configure.arg(format!("--cuda-path={cuda_path}"));
+            cuda_lib.link_paths.iter().for_each(|link_path| {
+                println!("cargo:rustc-link-arg=-L{}", link_path.to_string_lossy());
+            });
+            cuda_lib.include_paths.iter().for_each(|include_path| {
+                println!("cargo:rustc-link-arg=-I{}", include_path.to_string_lossy());
+            });
+        } else {
+            let cuda_path = env::var("CUDA_PATH")
+                .unwrap_or("C:\\Program Files\\NVIDIA GPU Computing Toolkit\\CUDA".to_string());
+
+            println!("cargo:rustc-link-arg=-L{cuda_path}/lib64");
+            println!("cargo:rustc-link-arg=-I{cuda_path}/include");
         }
     }
 
@@ -1077,6 +1076,7 @@ fn link_to_libraries(statik: bool, target_os: &str) {
     ) {
         println!("cargo:rustc-link-arg=-Wl,--no-as-needed");
     }
+
     if env::var("CARGO_FEATURE_BUILD_ZLIB").is_ok() && target_os == "linux" {
         println!("cargo:rustc-link-lib=z");
     }
@@ -1153,7 +1153,16 @@ fn main() {
                 })
         }
 
-        vec![search().join("include")]
+        let mut include_paths = vec![search().join("include")];
+        if env::var("CARGO_FEATURE_BUILD_NVIDIA").is_ok() && target_os == "linux" {
+            let cuda_lib = pkg_config::probe_library("cuda").expect("CUDA is not found");
+
+            for include_path in cuda_lib.include_paths {
+                include_paths.push(include_path);
+            }
+        }
+
+        include_paths
     }
     // Use prebuilt library
     else if let Ok(ffmpeg_dir) = env::var("FFMPEG_DIR") {
@@ -1776,6 +1785,10 @@ fn main() {
 
     if env::var("CARGO_FEATURE_AVRESAMPLE").is_ok() {
         builder = builder.header(search_include(&include_paths, "libavresample/avresample.h"));
+    }
+
+    if env::var("CARGO_FEATURE_BUILD_NVIDIA").is_ok() {
+        builder = builder.header(search_include(&include_paths, "cuda.h"));
     }
 
     builder = builder
